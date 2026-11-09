@@ -33,6 +33,9 @@
   // that don't want to wait for the localStorage round-trip.
   const _data = new Map();
   const _inflight = new Map();
+  // The latest request asked per exchange, and the one whose answer is kept.
+  const _gen = new Map();
+  const _kept = new Map();
 
   const todayISOInTZ = (tz) => {
     try {
@@ -149,6 +152,21 @@
 
   const US_INDICES = new Set(['GSPC', 'IXIC', 'DJI', 'NDX', 'RUT', 'VIX', 'NYA', 'OEX', 'MID', 'SML', 'DJT', 'DJU', 'SOX', 'W5000', 'RUI', 'RUA']);
 
+  // How long load() waits for an exchange's details. The terminal's request
+  // has no deadline of its own, and whatever waited on a status that hung --
+  // the heatmap's quotes, the calendar's holidays, the asset page's hours, a
+  // stock's live feed -- waited as long as the browser kept it open. Past it, load() answers as failed (not kept), and
+  // the request's own answer, whenever it comes, is kept as before. The
+  // open apps' client gives up at the same 25 s.
+  const LOAD_DEADLINE_MS = 25000;
+  const TIMED_OUT = () => ({ _notFound: true, _failed: true, _timedOut: true });
+  const deadline = () => window.EXCHANGE_STATUS_DEADLINE_MS || LOAD_DEADLINE_MS;
+  const bounded = (entry) => new Promise((resolve, reject) => {
+    const left = deadline() - (Date.now() - entry.at);
+    const t = setTimeout(() => resolve(TIMED_OUT()), Math.max(0, left));
+    entry.p.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
+  });
+
   const ExchangeStatus = {
     normalisePayload,
     todayISOInTZ,
@@ -185,10 +203,20 @@
       if (!exchange) return null;
       if (this.is24x7(exchange)) return null;
       const fresh = !!(opts && opts.fresh);
-      if (fresh && this.failed(exchange) && !_inflight.has(exchange)) _data.delete(exchange);
+      // A request still out past the deadline is no answer to wait for any
+      // more: a fresh retry (the calendar's Try again) asks anew instead of
+      // joining it -- it joined, and timed out again at once, until the
+      // hung request ended. A plain load still joins it.
+      const out = _inflight.get(exchange);
+      const expired = Boolean(out) && Date.now() - out.at >= deadline();
+      if (fresh && this.failed(exchange) && (!out || expired)) _data.delete(exchange);
       if (_data.has(exchange)) return _data.get(exchange);
-      if (_inflight.has(exchange)) return _inflight.get(exchange);
+      if (out && !(fresh && expired)) return bounded(out);
 
+      // Which request this is: an older one that answers late does not
+      // overwrite what a newer one already brought.
+      const gen = (_gen.get(exchange) || 0) + 1;
+      _gen.set(exchange, gen);
       const p = (async () => {
         const api = window.EODHD_API;
         if (!api || !api.getExchangeHolidaysV2) return null;
@@ -197,11 +225,16 @@
         // The legacy v1 endpoint returns the payload at the root. Unwrap
         // here so the rest of this module can stay agnostic.
         const data = normalisePayload(raw && raw.data && typeof raw.data === 'object' ? raw.data : raw, exchange);
-        if (data && !data.error) _data.set(exchange, data);
+        if (data && !data.error && gen >= (_kept.get(exchange) || 0)) { _data.set(exchange, data); _kept.set(exchange, gen); }
         return data;
       })();
-      _inflight.set(exchange, p);
-      try { return await p; } finally { _inflight.delete(exchange); }
+      const entry = { p, at: Date.now() };
+      _inflight.set(exchange, entry);
+      // Kept while it is out, however long: a caller that comes later joins
+      // it rather than sending a second request beside one that hangs.
+      const done = () => { if (_inflight.get(exchange) === entry) _inflight.delete(exchange); };
+      p.then(done, done);
+      return bounded(entry);
     },
 
     // The payload load() kept, and a way to hand one back: the calendar keeps

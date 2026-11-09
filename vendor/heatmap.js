@@ -153,6 +153,16 @@ window.HeatmapChange = {
     if (r == null) return '—';
     return (r > 0 ? '+' : '') + r.toFixed(d) + '%';
   },
+  // The same change read out (a tile's aria-label), from the same rounding
+  // as format(): toFixed on the raw value read 1.005 as "up 1.00 percent"
+  // beside the tile's "+1.01%".
+  spoken(v, digits) {
+    const d = digits == null ? 1 : digits;
+    const r = window.HeatmapChange.shown(v, d);
+    if (r == null) return 'no quote';
+    if (r === 0) return 'unchanged, ' + (0).toFixed(d) + ' percent';
+    return (r > 0 ? 'up ' : 'down ') + Math.abs(r).toFixed(d) + ' percent';
+  },
 };
 
 // Whether the screener rows already ARE the quotes. Outside the trading day a
@@ -739,6 +749,13 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
   // (prevSessionInfo) re-reads the session even when the banner stays empty,
   // and the real-time overlay is decided on them (below).
   const [exLoaded, setExLoaded] = React.useState(null);
+  // Set when the exchange's status has been out EX_WAIT_MS without settling:
+  // the real-time quotes are asked without it. They waited for it to the
+  // end, and a status that hung held them back 25 s, then sent a second one
+  // under "Updating..." and brought the failure panel at 51 s. It answers in well under the wait, so a status that
+  // answers decides as before.
+  const [exWaited, setExWaited] = React.useState(null);
+  const EX_WAIT_MS = window.HEATMAP_EX_WAIT_MS || 1200;
 
   // Compute the symbols actually visible on the current heatmap. Used both
   // by the live-overlay fetch (so Dow30 doesn't fetch 500 quotes when 30
@@ -883,6 +900,18 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
     return window.HeatmapQuoteNeed.screenerIsCurrent(rows, session, lastClosed) ? rows : null;
   }, [selectedIndex, screenerData, computeVisibleSymbols]);
 
+  // The overlay's view of the exchange status: 'hours' once they are in,
+  // 'none' once they failed or have been out longer than EX_WAIT_MS, null
+  // while they can still come in time. A status that fails after the wait
+  // changes nothing (no second batch); hours that come in late decide again.
+  const exGateOf = (ex) => {
+    const ES = window.ExchangeStatus;
+    if (!ES || !ES.load) return 'none';
+    if (exLoaded === ex && ES.isLoaded && ES.isLoaded(ex) && !(ES.failed && ES.failed(ex))) return 'hours';
+    return exLoaded === ex || exWaited === ex ? 'none' : null;
+  };
+  const exGate = exGateOf((INDEX_COMPONENTS[selectedIndex] && INDEX_COMPONENTS[selectedIndex].exchange) || 'US');
+
   // RT overlay fetch — also triggers when screenerData first arrives.
   // Forex / crypto have their own loader (loadForexCryptoData), so this
   // effect handles US stock indices only.
@@ -891,16 +920,21 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
     const cfg = INDEX_COMPONENTS[selectedIndex];
     if (cfg?.type === 'forex' || cfg?.type === 'crypto') return;
     if (!screenerData.length || !apiKey || rtTrigger === 0) return;
-    // Decided once the exchange's status is in (exLoaded, below), answered
+    // Decided once the exchange's status is in (exGate, above), answered
     // or failed: before it, screenerCoversQuotes could not tell and the
     // real-time quotes went over the screener's rows, after it they did not
     // -- which source a tile showed depended on which came first.
-    const ESd = window.ExchangeStatus;
-    if (ESd && ESd.load && exLoaded !== ((cfg && cfg.exchange) || 'US')) return;
+    // Not waited for past EX_WAIT_MS (exWaited).
+    if (!exGate) return;
     if (screenerCoversQuotes()) {                          // nothing newer to ask for
       // ...and an overlay left from an earlier session would sit on top of
       // the rows that are now current: drop it.
       if (Object.keys(rtOverlay).length && onRtOverlayUpdate) onRtOverlayUpdate({});
+      // A batch still out (asked before the status came, after the wait)
+      // is no longer wanted: it ends here, and its "Updating..." with it.
+      // It stayed, Refresh disabled, after every request had settled.
+      rtGuardRef.current.seq++;
+      setRtLoadingGated(false);
       return;
     }
     // And for the screener rows: drawn from the member list alone the order
@@ -938,17 +972,19 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
             return b;
           }, (e) => { batchFailed = batchFailed || e || {}; return {}; }))
         );
-        if (!onScreen()) return;
+        // Off screen (decided again since): its loading ends unless a newer
+        // load runs, which ends its own.
+        if (!onScreen()) { if (seq === g.seq) setRtLoadingGated(false); return; }
         const overlay = {};
         const ESx = window.ExchangeStatus;
         const exCode = (cfg && cfg.exchange) || 'US';
-        // On a cold open the hours may not be in yet, and without them nothing
-        // can be judged pre-market: wait for them first.
-        if (ESx && ESx.load && ESx.isLoaded && !ESx.isLoaded(exCode)) {
-          try { await ESx.load(exCode, apiKey); } catch (_) {}
-          if (!onScreen()) return;
-        }
-        const regHours = ESx && ESx.getRegularHours ? ESx.getRegularHours(exCode) : null;
+        // The hours judge a pre-market print. Not in yet, or
+        // not served: a US exchange opens at 09:30 New York time all the
+        // same. Not waited for here: a status that hung held "Updating..."
+        // over the whole map for another 25 s and asked for itself a second
+        // time.
+        const regHours = (ESx && ESx.getRegularHours ? ESx.getRegularHours(exCode) : null)
+          || (exCode === 'US' ? { open: '09:30:00', close: '16:00:00', tz: 'America/New_York' } : null);
         batchResults.forEach(batch => {
           Object.entries(batch || {}).forEach(([key, q]) => {
             if (!q) return;
@@ -979,7 +1015,7 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
       if (onScreen() && seq === g.seq) setRtLoadingGated(false);
     })();
     return () => { if (g.scope === scope) g.scope = null; };
-  }, [rtTrigger, screenerData.length, apiKey, sessionMode, selectedIndex, displayLimit, computeVisibleSymbols, membersPending, loading, screenerCoversQuotes, exLoaded]);
+  }, [rtTrigger, screenerData.length, apiKey, sessionMode, selectedIndex, displayLimit, computeVisibleSymbols, membersPending, loading, screenerCoversQuotes, exGate]);
 
   // Live prices on top of the snapshot:
   // the heatmap never streamed, even on a paid key. The largest tiles (stocks:
@@ -1068,7 +1104,7 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
         scope = ['pm', selectedIndex, apiKey, symbols.join(',')].join('|');
         g.scope = scope;
         const batch = (await window.EODHD_API.getExtendedQuotes(apiKey, symbols)) || {};
-        if (!onScreen()) return;
+        if (!onScreen()) { if (seq === g.seq) setRtLoadingGated(false); return; }
         const overlay = {};
         let maxEthTime = 0;
         let traded = 0;
@@ -1105,8 +1141,11 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
         if (gotAny) { g.servedScope = scope; g.servedSeq = seq; g.servedAt = Date.now(); }
         if (onPremarketUpdate) {
           // No quote at all back: the feed failed or was refused. Say so
-          // rather than let the tiles read as "nothing traded".
-          onPremarketUpdate(overlay, { lastEthTime: maxEthTime || null, tradedCount: traded, failed: Object.keys(batch).length === 0 });
+          // rather than let the tiles read as "nothing traded" -- and why,
+          // when the client says what failed (`fail`): a 500 read "no
+          // pre-market quotes available".
+          const none = Object.keys(batch).length === 0;
+          onPremarketUpdate(overlay, { lastEthTime: maxEthTime || null, tradedCount: traded, failed: none, fail: none && batch._failed ? window.RateLimitWait.failure(batch._failed) : null });
         }
       } catch (e) {}
       if (onScreen() && seq === g.seq) setRtLoadingGated(false);
@@ -1343,9 +1382,13 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
     const ES = window.ExchangeStatus;
     if (!ES) return;
     let cancelled = false;
+    // Still out after EX_WAIT_MS: the quotes go without it (exWaited).
+    const waitTimer = setTimeout(() => { if (!cancelled) setExWaited(heatmapExchange); }, EX_WAIT_MS);
     (async () => {
       // A load that failed settles it too: the overlay waits for no more.
+      // ExchangeStatus.load ends a request that hangs at its own deadline.
       try { await ES.load(heatmapExchange, apiKey); } catch (_) { /* failed() says */ }
+      clearTimeout(waitTimer);
       if (cancelled) return;
       setExLoaded(heatmapExchange);
       const session = ES.getCurrentSession(heatmapExchange);
@@ -1368,7 +1411,7 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
         setExBanner(null);
       }
     })();
-    return () => { cancelled = true; };
+    return () => { cancelled = true; clearTimeout(waitTimer); };
   }, [heatmapExchange, apiKey]);
   const showLimitDropdown = cfg?.limitOptions && cfg.limitOptions.length > 0;
   const currentCount = filteredData.length;
@@ -1642,7 +1685,7 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
               ? (rtLoading
                   ? ' • Pre-Market • loading...'
                   : premarketMeta.failed
-                  ? ' • Pre-Market • no pre-market quotes available'
+                  ? (premarketMeta.fail ? ' • Pre-Market • quotes did not load: ' + window.RateLimitWait.failReason(premarketMeta.fail) : ' • Pre-Market • no pre-market quotes available')
                   : ` • Pre-Market • delayed ~15m${premarketMeta.lastEthTime ? ' • last ' + new Date(premarketMeta.lastEthTime < 4e10 ? premarketMeta.lastEthTime * 1000 : premarketMeta.lastEthTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}${premarketMeta.tradedCount ? ' • ' + premarketMeta.tradedCount + ' traded' : ''}`)
               : (() => {
                   // Labelled by the feed actually behind the prices, never a
@@ -2021,7 +2064,7 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
                     onFocus: function (e) { var kb = true; try { kb = e.currentTarget.matches(':focus-visible'); } catch (_) {} if (kb) setTileHint(idx); },
                     onBlur: function () { setTileHint(null); },
                     onPointerDown: function (e) { touchRef.current = e.pointerType === 'touch' || e.pointerType === 'pen'; },
-                    'aria-label': (tile.label || tile.code || tile.symbol) + ' ' + (tile.changeP == null ? 'no quote' : (tile.changeP >= 0 ? 'up ' : 'down ') + Math.abs(tile.changeP).toFixed(2) + ' percent'),
+                    'aria-label': (tile.label || tile.code || tile.symbol) + ' ' + window.HeatmapChange.spoken(tile.changeP, 2),
                     // On hover: what a small tile or a cut sector label cannot show.
                     title: tileHintText(tile),
                     onKeyDown: function (e) {
