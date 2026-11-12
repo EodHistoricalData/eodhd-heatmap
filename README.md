@@ -15,7 +15,7 @@ npm start                 # http://localhost:5173
 ```
 
 Put your EODHD API key in `.env` — [get one here](https://eodhd.com/register?utm_source=eodhd_oss&utm_medium=app&utm_campaign=heatmap&utm_content=readme).
-The map needs index fundamentals and real-time quotes; the Screener API adds detail where the plan has it and is not required. Whatever else your key cannot reach is named on screen in EODHD's own words; a plan without the Screener gets the map without that detail, and no notice. There is no demo mode: without a key the app tells you so
+The map needs index fundamentals and live quotes, which come together on All-In-One; the Screener API adds detail where the plan has it and is not required. Whatever else your key cannot reach is named on screen in EODHD's own words; a plan without the Screener gets the map without that detail, and no notice. There is no demo mode: without a key the app tells you so
 and does nothing else.
 
 Tested in current Chrome and Firefox on Node 20 and 24. Other browsers
@@ -43,7 +43,7 @@ through the screens you visited.
 
 ## What it needs from your plan
 
-The map is drawn from each index's member list (the index's fundamentals), priced with real-time quotes. The Screener API, on plans that include it, fills in extra rows; on a plan without it the map still draws.
+The map is drawn from each index's member list (the index's fundamentals), priced with live quotes; All-In-One has both. The Screener API, on plans that include it, fills in extra rows; on a plan without it the map still draws.
 
 When a request comes back `403`, the app shows you EODHD's own explanation of
 what is missing rather than a generic error. The exception is the Screener API: the map only uses it for extra detail and draws the same tiles without it, so a plan without it gets no notice.

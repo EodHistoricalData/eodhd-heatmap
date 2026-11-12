@@ -36,6 +36,10 @@
   // The latest request asked per exchange, and the one whose answer is kept.
   const _gen = new Map();
   const _kept = new Map();
+  // A failure kept for an exchange: when, how many in a row, and why. A
+  // later load asks again once the pace allows (retryIn), instead of the
+  // failure standing for the page's life.
+  const _failedAt = new Map();
 
   const todayISOInTZ = (tz) => {
     try {
@@ -161,9 +165,37 @@
   const LOAD_DEADLINE_MS = 25000;
   const TIMED_OUT = () => ({ _notFound: true, _failed: true, _timedOut: true });
   const deadline = () => window.EXCHANGE_STATUS_DEADLINE_MS || LOAD_DEADLINE_MS;
-  const bounded = (entry) => new Promise((resolve, reject) => {
+  // A failure is kept, a timeout too: a status that hung was not, so nothing
+  // knew it had failed -- the heatmap never asked for it again, its Refresh
+  // did not either, and its session line and holiday banners never came.
+  // An answer already kept is not replaced by a failure. The reason is
+  // fixed when it is kept: a wait that starts later does not turn a timeout
+  // into "the limit".
+  const failureOf = (body) => {
+    const R = window.RateLimitWait;
+    if (body._unreadable) return R && R.failure ? R.failure({ unreadable: true, status: 200 }) : { unreadable: true, status: 200 };
+    if (body._status) return R && R.failure ? R.failure({ status: body._status }) : { status: body._status };
+    return { limited: false, status: 0, at: Date.now() };
+  };
+  const keepFailure = (exchange, body) => {
+    const had = _data.get(exchange);
+    if (had && !had._failed) return;
+    _data.set(exchange, { ...body, _fail: body._fail || failureOf(body) });
+    const f = _failedAt.get(exchange);
+    _failedAt.set(exchange, { at: Date.now(), n: (f ? f.n : 0) + 1 });
+  };
+  // The pace of the asking again: as every panel's automatic reload
+  // (RateLimitWait.reloadDelay -- 5 s, 10 s, 20 s ... 2 min).
+  const reloadDelay = (n) => {
+    const R = window.RateLimitWait;
+    return R && R.reloadDelay ? R.reloadDelay(n) : Math.min(120000, 5000 * Math.pow(2, Math.max(0, n - 1)));
+  };
+  const bounded = (entry, exchange) => new Promise((resolve, reject) => {
     const left = deadline() - (Date.now() - entry.at);
-    const t = setTimeout(() => resolve(TIMED_OUT()), Math.max(0, left));
+    const t = setTimeout(() => {
+      if (!entry.timedOut) { entry.timedOut = true; keepFailure(exchange, TIMED_OUT()); }
+      resolve(TIMED_OUT());
+    }, Math.max(0, left));
     entry.p.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
   });
 
@@ -199,19 +231,29 @@
     },
 
     // opts.fresh: ask again when what is kept is a failure (failed() below).
+    // A plain load asks again too, once a kept failure is older than the
+    // pace allows (retryIn).
     async load(exchange, apiKey, opts) {
       if (!exchange) return null;
       if (this.is24x7(exchange)) return null;
-      const fresh = !!(opts && opts.fresh);
+      const due = this.failed(exchange) && this.retryIn(exchange) === 0;
+      const fresh = !!(opts && opts.fresh) || due;
       // A request still out past the deadline is no answer to wait for any
       // more: a fresh retry (the calendar's Try again) asks anew instead of
       // joining it -- it joined, and timed out again at once, until the
       // hung request ended. A plain load still joins it.
       const out = _inflight.get(exchange);
-      const expired = Boolean(out) && Date.now() - out.at >= deadline();
-      if (fresh && this.failed(exchange) && (!out || expired)) _data.delete(exchange);
+      // Past its deadline by the clock, or by its own timer having fired: a
+      // clock that is set or held still kept a hung request "fresh" for ever.
+      const expired = Boolean(out) && (Boolean(out.timedOut) || Date.now() - out.at >= deadline());
+      // Asked over a kept failure: an answer of nothing (the client's wait
+      // refused the ask, the SDK gave up) keeps the failure, as the limit
+      // while the wait runs. It dropped it: the line saying the status is
+      // missing went, and nothing asked again.
+      const over = fresh && this.failed(exchange) && (!out || expired);
+      if (over) _data.delete(exchange);
       if (_data.has(exchange)) return _data.get(exchange);
-      if (out && !(fresh && expired)) return bounded(out);
+      if (out && !(fresh && expired)) return bounded(out, exchange);
 
       // Which request this is: an older one that answers late does not
       // overwrite what a newer one already brought.
@@ -225,7 +267,13 @@
         // The legacy v1 endpoint returns the payload at the root. Unwrap
         // here so the rest of this module can stay agnostic.
         const data = normalisePayload(raw && raw.data && typeof raw.data === 'object' ? raw.data : raw, exchange);
-        if (data && !data.error && gen >= (_kept.get(exchange) || 0)) { _data.set(exchange, data); _kept.set(exchange, gen); }
+        if (data && !data.error && gen >= (_kept.get(exchange) || 0)) {
+          if (data._failed) keepFailure(exchange, data);
+          else { _data.set(exchange, data); _kept.set(exchange, gen); _failedAt.delete(exchange); }
+        } else if (!data && over && gen >= (_kept.get(exchange) || 0)) {
+          const R = window.RateLimitWait;
+          keepFailure(exchange, { _notFound: true, _failed: true, _fail: R && R.failure ? R.failure(null) : { limited: false, status: 0, at: Date.now() } });
+        }
         return data;
       })();
       const entry = { p, at: Date.now() };
@@ -234,7 +282,25 @@
       // it rather than sending a second request beside one that hangs.
       const done = () => { if (_inflight.get(exchange) === entry) _inflight.delete(exchange); };
       p.then(done, done);
-      return bounded(entry);
+      return bounded(entry, exchange);
+    },
+
+    // Milliseconds until a load may ask again for an exchange whose status
+    // failed (0: now), or null when nothing failed. Never inside the
+    // client's wait (Retry-After): asked on the pace alone (5 s) under
+    // Retry-After: 20, the ask was refused before it left.
+    retryIn(exchange) {
+      const f = _failedAt.get(exchange);
+      if (!f || !this.failed(exchange)) return null;
+      const R = window.RateLimitWait;
+      const now = Date.now();
+      const wait = R && R.until ? R.until() : 0;
+      return Math.max(0, f.at + reloadDelay(f.n) - now, wait ? wait - now : 0);
+    },
+    // Why the status failed (RateLimitWait.failure), or null.
+    failure(exchange) {
+      const d = _data.get(exchange);
+      return d && d._failed ? (d._fail || failureOf(d)) : null;
     },
 
     // The payload load() kept, and a way to hand one back: the calendar keeps
@@ -243,7 +309,8 @@
       return _data.has(exchange) ? _data.get(exchange) : null;
     },
     prime(exchange, data) {
-      if (exchange && data && typeof data === 'object' && !data.error && !_data.has(exchange)) _data.set(exchange, normalisePayload(data, exchange));
+      if (!exchange || !data || typeof data !== 'object' || data.error || data._failed) return;
+      if (!_data.has(exchange) || this.failed(exchange)) { _data.set(exchange, normalisePayload(data, exchange)); _failedAt.delete(exchange); }
     },
 
     // True once load() has an answer for this exchange — including the

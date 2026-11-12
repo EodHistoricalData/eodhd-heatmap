@@ -756,6 +756,15 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
   // answers decides as before.
   const [exWaited, setExWaited] = React.useState(null);
   const EX_WAIT_MS = window.HEATMAP_EX_WAIT_MS || 1200;
+  // A status that failed or hung is asked again: by itself, paced as every
+  // panel's reload is (ExchangeStatus.retryIn), and by Refresh at once. It
+  // was asked once: after the 25 s deadline nothing asked again, the
+  // subtitle kept "Updated ..." for the session line and no holiday or
+  // half-day banner could come. `exFail`: { ex, failure } until a status
+  // arrives, for the line that says so.
+  const [exAsk, setExAsk] = React.useState(0);
+  const exAskFreshRef = React.useRef(false);
+  const [exFail, setExFail] = React.useState(null);
 
   // Compute the symbols actually visible on the current heatmap. Used both
   // by the live-overlay fetch (so Dow30 doesn't fetch 500 quotes when 30
@@ -1378,19 +1387,29 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
   const heatmapExchange = isForexOrCrypto ? null : (cfg?.exchange || 'US');
   const [exBanner, setExBanner] = React.useState(null);
   React.useEffect(() => {
-    if (!heatmapExchange || !apiKey) { setExBanner(null); return; }
+    if (!heatmapExchange || !apiKey) { setExBanner(null); setExFail(null); return; }
     const ES = window.ExchangeStatus;
     if (!ES) return;
     let cancelled = false;
+    let retryTimer = null;
+    setExFail(prev => (prev && prev.ex !== heatmapExchange ? null : prev));
     // Still out after EX_WAIT_MS: the quotes go without it (exWaited).
     const waitTimer = setTimeout(() => { if (!cancelled) setExWaited(heatmapExchange); }, EX_WAIT_MS);
+    const fresh = exAskFreshRef.current;
+    exAskFreshRef.current = false;
     (async () => {
       // A load that failed settles it too: the overlay waits for no more.
       // ExchangeStatus.load ends a request that hangs at its own deadline.
-      try { await ES.load(heatmapExchange, apiKey); } catch (_) { /* failed() says */ }
+      try { await ES.load(heatmapExchange, apiKey, fresh ? { fresh: true } : undefined); } catch (_) { /* failed() says */ }
       clearTimeout(waitTimer);
       if (cancelled) return;
       setExLoaded(heatmapExchange);
+      // Failed (a timeout too): said until a status comes, and asked again
+      // when the pace allows.
+      const failed = ES.failed && ES.failed(heatmapExchange);
+      setExFail(failed ? { ex: heatmapExchange, failure: (ES.failure && ES.failure(heatmapExchange)) || null } : null);
+      const due = failed && ES.retryIn ? ES.retryIn(heatmapExchange) : null;
+      if (due != null) retryTimer = setTimeout(() => { if (!cancelled) { exAskFreshRef.current = true; setExAsk(n => n + 1); } }, due + 50);
       const session = ES.getCurrentSession(heatmapExchange);
       const hol = ES.getHolidayToday(heatmapExchange);
       const isEarly = ES.isEarlyCloseToday(heatmapExchange);
@@ -1411,8 +1430,17 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
         setExBanner(null);
       }
     })();
-    return () => { cancelled = true; clearTimeout(waitTimer); };
-  }, [heatmapExchange, apiKey]);
+    return () => { cancelled = true; clearTimeout(waitTimer); clearTimeout(retryTimer); };
+  }, [heatmapExchange, apiKey, exAsk]);
+  // Refresh and the line's Try again ask for a status that is missing at
+  // once; one still on its way is joined, not sent twice.
+  const askStatusAgain = () => {
+    const ES = window.ExchangeStatus;
+    if (!heatmapExchange || !ES || !ES.isLoaded) return;
+    if (ES.isLoaded(heatmapExchange) && !(ES.failed && ES.failed(heatmapExchange))) return;
+    exAskFreshRef.current = true;
+    setExAsk(n => n + 1);
+  };
   const showLimitDropdown = cfg?.limitOptions && cfg.limitOptions.length > 0;
   const currentCount = filteredData.length;
   // The tiles the map has before the Gainers/Losers filter.
@@ -1626,6 +1654,9 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
     if (isForexOrCrypto || sessionMode !== 'regular' || !heatmapExchange) return null;
     const ES = window.ExchangeStatus;
     if (!ES || !ES.isPrevSessionQuote || !(ES.isLoaded && ES.isLoaded(heatmapExchange))) return null;
+    // A status that failed tells no session: "Market closed" read off a
+    // missing one would be a guess.
+    if (ES.failed && ES.failed(heatmapExchange)) return null;
     const hours = ES.getRegularHours(heatmapExchange);
     const tz = (hours && hours.tz) || 'America/New_York';
     const session = ES.getCurrentSession(heatmapExchange);
@@ -1710,7 +1741,7 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
                 })()}
           </p>
         </div>
-        <button onClick={() => { if (rlWait.hold()) return; refreshRealTime(); window.Haptics?.light?.(); }} disabled={rtLoading} aria-disabled={waitLeft ? 'true' : undefined}
+        <button onClick={() => { if (rlWait.hold()) return; refreshRealTime(); askStatusAgain(); window.Haptics?.light?.(); }} disabled={rtLoading} aria-disabled={waitLeft ? 'true' : undefined}
           aria-label={waitLeft ? `Refresh prices (in ${waitLeft} s)` : 'Refresh prices'} title={waitLeft ? `Too many requests: refresh in ${waitLeft} s` : undefined} style={{
           width: '40px', height: '40px', borderRadius: '12px',
           display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -1727,6 +1758,15 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
       {/* Refresh pressed inside the wait over a drawn map: the note here (the
           empty-map panels carry their own under Try again). */}
       {filteredData.length > 0 && !noPrices && waitNoteEl}
+
+      {/* The exchange's status did not come (a timeout too): said until it
+          does -- the session line and the holiday banners wait for it. Not
+          beside a host's own panel that already says EODHD did not answer. */}
+      {exFail && exFail.ex === heatmapExchange && !(window.Entitlement && window.Entitlement.explained && window.Entitlement.explained()) && (
+        <window.RateLimitWait.FailNote panel="heatmap-status" what={`The ${heatmapExchange} market hours`} failure={exFail.failure}
+          onRetry={askStatusAgain} autoRetry={false} isDark={isDark} extra="The session line and holiday notices need them."
+          style={{ margin: '0 20px 12px', fontSize: 12 }} />
+      )}
 
       {/* Trading-hours banner — surfaces EarlyClose half-days and full-day
           closures from /v2/exchange-details, so a flat heatmap doesn't look
