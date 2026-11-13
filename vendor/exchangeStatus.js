@@ -177,6 +177,23 @@
     if (body._status) return R && R.failure ? R.failure({ status: body._status }) : { status: body._status };
     return { limited: false, status: 0, at: Date.now() };
   };
+  // An answer that brings no status, whoever gave it, as the failure kept.
+  // The open apps' client answers a 500, a 429, a refusal, its own 25 s
+  // timeout and a dropped connection with { error: 'not served' }; the
+  // terminal's answers a dropped connection, and an ask its 429 wait
+  // refused, with null; either may throw. None was kept: failed() stayed
+  // false, retryIn null, the heatmap never asked again and its line never
+  // came. Why: the client's own words when it has them,
+  // else the wait (RateLimitWait.failure) -- inside it nothing is sent.
+  // "No such exchange" is not one: { _notFound: true } with no _failed mark
+  // (a 404 from v2 and v1 in the terminal, a 404 in the open apps) is an
+  // answer, kept as before and never asked again.
+  const noStatus = (data, thrown) => {
+    const R = window.RateLimitWait;
+    const why = thrown || (data && typeof data === 'object' && (data.status || data._status) ? { status: data.status || data._status } : null);
+    return { _notFound: true, _failed: true, _fail: R && R.failure ? R.failure(why) : { limited: false, status: 0, at: Date.now() } };
+  };
+  const hasStatus = (data) => Boolean(data) && typeof data === 'object' && !Array.isArray(data) && !data.error;
   const keepFailure = (exchange, body) => {
     const had = _data.get(exchange);
     if (had && !had._failed) return;
@@ -262,18 +279,22 @@
       const p = (async () => {
         const api = window.EODHD_API;
         if (!api || !api.getExchangeHolidaysV2) return null;
-        const raw = await api.getExchangeHolidaysV2(apiKey, exchange, fresh ? { fresh: true } : undefined);
+        let raw;
+        try {
+          raw = await api.getExchangeHolidaysV2(apiKey, exchange, fresh ? { fresh: true } : undefined);
+        } catch (e) {
+          const failed = noStatus(null, e || {});
+          if (gen >= (_kept.get(exchange) || 0)) keepFailure(exchange, failed);
+          return failed;
+        }
         // v2 wraps the payload in { data: {...}, meta: [], links: [] }.
         // The legacy v1 endpoint returns the payload at the root. Unwrap
         // here so the rest of this module can stay agnostic.
         const data = normalisePayload(raw && raw.data && typeof raw.data === 'object' ? raw.data : raw, exchange);
-        if (data && !data.error && gen >= (_kept.get(exchange) || 0)) {
-          if (data._failed) keepFailure(exchange, data);
-          else { _data.set(exchange, data); _kept.set(exchange, gen); _failedAt.delete(exchange); }
-        } else if (!data && over && gen >= (_kept.get(exchange) || 0)) {
-          const R = window.RateLimitWait;
-          keepFailure(exchange, { _notFound: true, _failed: true, _fail: R && R.failure ? R.failure(null) : { limited: false, status: 0, at: Date.now() } });
-        }
+        if (gen < (_kept.get(exchange) || 0)) return data;
+        if (!hasStatus(data)) keepFailure(exchange, noStatus(data));
+        else if (data._failed) keepFailure(exchange, data);
+        else { _data.set(exchange, data); _kept.set(exchange, gen); _failedAt.delete(exchange); }
         return data;
       })();
       const entry = { p, at: Date.now() };

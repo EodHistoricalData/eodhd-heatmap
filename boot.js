@@ -10,7 +10,8 @@ window.APP_META = {
   "keyNote": "The map needs index fundamentals and live quotes, which come together on All-In-One; the Screener API adds detail where the plan has it and is not required. Whatever else your key cannot reach is named on screen in EODHD's own words; a plan without the Screener gets the map without that detail, and no notice.",
   "storage": [
     "eodhd_heatmap_"
-  ]
+  ],
+  "ownFailures": []
 };
 
 if (!window.React || !window.ReactDOM) {

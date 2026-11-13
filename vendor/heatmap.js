@@ -765,6 +765,21 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
   const [exAsk, setExAsk] = React.useState(0);
   const exAskFreshRef = React.useRef(false);
   const [exFail, setExFail] = React.useState(null);
+  // A status asked again (the line's Try again, Refresh, the paced repeat)
+  // marks the line's Try again busy until it answers (RateLimitWait.setBusy):
+  // it reads "Loading…" and a press sends nothing. It said "Try again" all
+  // the while, and five presses were five asks.
+  // `exBusyRef`: the mark a press made, handed to the load it starts.
+  const exBusyRef = React.useRef(null);
+  const exBusyKey = (ex) => 'heatmap-status:' + ex;
+  // A press whose load never took its mark (the view left in the same
+  // batch) ends with the view: the mark is global, and on return the line's
+  // Try again read "Loading…" and refused presses.
+  React.useEffect(() => () => {
+    const pressed = exBusyRef.current;
+    exBusyRef.current = null;
+    if (pressed && window.RateLimitWait) window.RateLimitWait.endBusy(pressed.key, pressed.token);
+  }, []);
 
   // Compute the symbols actually visible on the current heatmap. Used both
   // by the live-overlay fetch (so Dow30 doesn't fetch 500 quotes when 30
@@ -1387,9 +1402,12 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
   const heatmapExchange = isForexOrCrypto ? null : (cfg?.exchange || 'US');
   const [exBanner, setExBanner] = React.useState(null);
   React.useEffect(() => {
-    if (!heatmapExchange || !apiKey) { setExBanner(null); setExFail(null); return; }
+    const RLW = window.RateLimitWait;
+    const pressed = exBusyRef.current;
+    exBusyRef.current = null;
+    if (!heatmapExchange || !apiKey) { if (pressed && RLW) RLW.endBusy(pressed.key, pressed.token); setExBanner(null); setExFail(null); return; }
     const ES = window.ExchangeStatus;
-    if (!ES) return;
+    if (!ES) { if (pressed && RLW) RLW.endBusy(pressed.key, pressed.token); return; }
     let cancelled = false;
     let retryTimer = null;
     setExFail(prev => (prev && prev.ex !== heatmapExchange ? null : prev));
@@ -1397,12 +1415,20 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
     const waitTimer = setTimeout(() => { if (!cancelled) setExWaited(heatmapExchange); }, EX_WAIT_MS);
     const fresh = exAskFreshRef.current;
     exAskFreshRef.current = false;
+    // Asked again: busy until it answers (a press's own mark, or one here
+    // for the paced repeat).
+    const busyKey = exBusyKey(heatmapExchange);
+    const busy = pressed && pressed.key === busyKey ? pressed
+      : (fresh && RLW && RLW.setBusy ? { key: busyKey, token: RLW.setBusy(busyKey, 'load') } : null);
+    if (pressed && pressed !== busy && RLW) RLW.endBusy(pressed.key, pressed.token);
+    const unbusy = () => { if (busy && RLW) RLW.endBusy(busy.key, busy.token); };
     (async () => {
       // A load that failed settles it too: the overlay waits for no more.
       // ExchangeStatus.load ends a request that hangs at its own deadline.
       try { await ES.load(heatmapExchange, apiKey, fresh ? { fresh: true } : undefined); } catch (_) { /* failed() says */ }
       clearTimeout(waitTimer);
       if (cancelled) return;
+      unbusy();
       setExLoaded(heatmapExchange);
       // Failed (a timeout too): said until a status comes, and asked again
       // when the pace allows.
@@ -1430,16 +1456,36 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
         setExBanner(null);
       }
     })();
-    return () => { cancelled = true; clearTimeout(waitTimer); clearTimeout(retryTimer); };
+    return () => { cancelled = true; clearTimeout(waitTimer); clearTimeout(retryTimer); unbusy(); };
   }, [heatmapExchange, apiKey, exAsk]);
   // Refresh and the line's Try again ask for a status that is missing at
-  // once; one still on its way is joined, not sent twice.
+  // once; one still on its way is joined, not sent twice. Marked busy here,
+  // in the press itself: a second press before the load starts sends
+  // nothing either.
   const askStatusAgain = () => {
     const ES = window.ExchangeStatus;
+    const RLW = window.RateLimitWait;
     if (!heatmapExchange || !ES || !ES.isLoaded) return;
     if (ES.isLoaded(heatmapExchange) && !(ES.failed && ES.failed(heatmapExchange))) return;
+    const key = exBusyKey(heatmapExchange);
+    if (RLW && RLW.busyOf && RLW.busyOf(key)) return;
+    if (RLW && RLW.setBusy) exBusyRef.current = { key, token: RLW.setBusy(key, 'retry') };
     exAskFreshRef.current = true;
     setExAsk(n => n + 1);
+  };
+  // A host's own panel above this view (the open apps' frame) that says the
+  // key or the plan was refused says why the hours are missing too. One that
+  // only says EODHD did not answer neither names them nor asks for them
+  // again: the line stays beside it. At a 500, a 429, a dropped connection
+  // or a hang the apps showed that panel and no line.
+  const hostSaysRefused = () => {
+    const E = window.Entitlement;
+    if (!E) return false;
+    try {
+      if (E.anyDenied && E.anyDenied()) return true;
+      const p = E.problem ? E.problem() : null;
+      return Boolean(p && p.kind === 'key');
+    } catch (_) { return false; }
   };
   const showLimitDropdown = cfg?.limitOptions && cfg.limitOptions.length > 0;
   const currentCount = filteredData.length;
@@ -1761,11 +1807,13 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
 
       {/* The exchange's status did not come (a timeout too): said until it
           does -- the session line and the holiday banners wait for it. Not
-          beside a host's own panel that already says EODHD did not answer. */}
-      {exFail && exFail.ex === heatmapExchange && !(window.Entitlement && window.Entitlement.explained && window.Entitlement.explained()) && (
+          beside a host's own panel that already says the key or the plan
+          was refused (hostSaysRefused). Its Try again reads "Loading…"
+          while the status it asked for is out (busyKey). */}
+      {exFail && exFail.ex === heatmapExchange && !hostSaysRefused() && (
         <window.RateLimitWait.FailNote panel="heatmap-status" what={`The ${heatmapExchange} market hours`} failure={exFail.failure}
           onRetry={askStatusAgain} autoRetry={false} isDark={isDark} extra="The session line and holiday notices need them."
-          style={{ margin: '0 20px 12px', fontSize: 12 }} />
+          busyKey={exBusyKey(heatmapExchange)} style={{ margin: '0 20px 12px', fontSize: 12 }} />
       )}
 
       {/* Trading-hours banner — surfaces EarlyClose half-days and full-day
