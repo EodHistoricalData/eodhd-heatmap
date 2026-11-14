@@ -36,6 +36,12 @@
   // The latest request asked per exchange, and the one whose answer is kept.
   const _gen = new Map();
   const _kept = new Map();
+  // The key the latest request was asked with, per exchange: an answer for
+  // another key is not this one's.
+  const _lastKey = new Map();
+  const keyOf = (apiKey) => (apiKey == null ? null : String(apiKey));
+  // The in-flight table's key: the exchange and the API key it was asked with.
+  const flightOf = (exchange, key) => JSON.stringify([String(exchange), key]);
   // A failure kept for an exchange: when, how many in a row, and why. A
   // later load asks again once the pace allows (retryIn), instead of the
   // failure standing for the page's life.
@@ -188,12 +194,58 @@
   // "No such exchange" is not one: { _notFound: true } with no _failed mark
   // (a 404 from v2 and v1 in the terminal, a 404 in the open apps) is an
   // answer, kept as before and never asked again.
+  // The open apps' client now says why with it -- { error, status, limited,
+  // unreadable }, or { notServed: { … } } -- and that is read as the
+  // terminal's own is: a 500 is "answered with an error (500)", not "did
+  // not answer, or the connection dropped".
+  const whyOf = (data) => {
+    if (!data || typeof data !== 'object') return null;
+    const src = data.notServed && typeof data.notServed === 'object' ? data.notServed : data;
+    const status = Number(src.status || src._status || src.statusCode) || 0;
+    const limited = Boolean(src.limited || src.rateLimited);
+    const unreadable = Boolean(src.unreadable || src._unreadable);
+    if (!status && !limited && !unreadable) return null;
+    return { status, rateLimited: limited, unreadable };
+  };
   const noStatus = (data, thrown) => {
     const R = window.RateLimitWait;
-    const why = thrown || (data && typeof data === 'object' && (data.status || data._status) ? { status: data.status || data._status } : null);
+    const why = thrown || whyOf(data);
     return { _notFound: true, _failed: true, _fail: R && R.failure ? R.failure(why) : { limited: false, status: 0, at: Date.now() } };
   };
-  const hasStatus = (data) => Boolean(data) && typeof data === 'object' && !Array.isArray(data) && !data.error;
+  // A refusal of the key (401), of the day's quota or the plan (402) or of
+  // the plan (403) is an answer for this key, not a failure to repeat: kept
+  // as one, never asked again while the key is the same. Repeated at 5, 15,
+  // 35, 75 s over a working map, the 403 brought the open apps' panel back
+  // after each ask. `refused()` says which it was.
+  const REFUSALS = { 401: true, 402: true, 403: true };
+  const refusalOf = (f) => (f && !f.limited && !f.unreadable && REFUSALS[f.status] ? f.status : 0);
+  // `gen`: the request it answered -- kept as the newest answer, so an older
+  // request that brings hours late does not overwrite it.
+  // `daily`: a 402 the open apps' client read as the day's limit spent.
+  const keepRefusal = (exchange, status, apiKey, gen, daily) => {
+    _data.set(exchange, { _notFound: true, _refused: status, _daily: Boolean(daily), _key: apiKey == null ? null : String(apiKey) });
+    if (gen) _kept.set(exchange, gen);
+    _failedAt.delete(exchange);
+  };
+  // Whether a host's own panel above the screens (the open apps' frame)
+  // says a refusal already: the key refused (401); the day spent, or the
+  // plan refusing a feed (402). The terminal has no such panel, and its
+  // screens say every refusal themselves: a 401 or 402 there said nothing at
+  // all. A 403 is always the screens' to say (says()).
+  const hostSays = (status) => {
+    // One rule with every other line (RateLimitWait.hostSaysKey).
+    const R = window.RateLimitWait;
+    if (R && typeof R.hostSaysKey === 'function') return R.hostSaysKey({ status, limited: false, unreadable: false });
+    const E = window.Entitlement;
+    if (!E) return false;
+    try {
+      const p = typeof E.problem === 'function' ? E.problem() : null;
+      if (status === 401) return Boolean(p && (p.kind === 'key' || p.status === 401));
+      if (status === 402) return Boolean((typeof E.anyDenied === 'function' && E.anyDenied()) || (p && p.status === 402));
+    } catch (_) { return false; }
+    return false;
+  };
+  const hasStatus = (data) => Boolean(data) && typeof data === 'object' && !Array.isArray(data) && !data.error && !data.notServed;
   const keepFailure = (exchange, body) => {
     const had = _data.get(exchange);
     if (had && !had._failed) return;
@@ -210,7 +262,8 @@
   const bounded = (entry, exchange) => new Promise((resolve, reject) => {
     const left = deadline() - (Date.now() - entry.at);
     const t = setTimeout(() => {
-      if (!entry.timedOut) { entry.timedOut = true; keepFailure(exchange, TIMED_OUT()); }
+      // A request of a key no longer asked with keeps nothing.
+      if (!entry.timedOut) { entry.timedOut = true; if (entry.key === _lastKey.get(exchange)) keepFailure(exchange, TIMED_OUT()); }
       resolve(TIMED_OUT());
     }, Math.max(0, left));
     entry.p.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
@@ -254,12 +307,25 @@
       if (!exchange) return null;
       if (this.is24x7(exchange)) return null;
       const due = this.failed(exchange) && this.retryIn(exchange) === 0;
-      const fresh = !!(opts && opts.fresh) || due;
+      // A refusal is this key's: another key (a sign-in) asks again, and
+      // asks fresh -- the terminal's client keeps a failed answer for ten
+      // minutes under the exchange alone, and handed key A's 403 to key B
+      // with no request.
+      const key = keyOf(apiKey);
+      const had = _data.get(exchange);
+      const otherKey = Boolean(had && had._refused && had._key !== key);
+      if (otherKey) _data.delete(exchange);
+      const fresh = !!(opts && opts.fresh) || due || otherKey;
       // A request still out past the deadline is no answer to wait for any
       // more: a fresh retry (the calendar's Try again) asks anew instead of
       // joining it -- it joined, and timed out again at once, until the
       // hung request ended. A plain load still joins it.
-      const out = _inflight.get(exchange);
+      // Only a request of the same key: key B joined key A's, A's 403 came
+      // back as B's, and B's hours were never asked. Kept per
+      // exchange and key: one per exchange made A, B, A send A twice, B
+      // having taken A's place.
+      const flight = flightOf(exchange, key);
+      const out = _inflight.get(flight) || null;
       // Past its deadline by the clock, or by its own timer having fired: a
       // clock that is set or held still kept a hung request "fresh" for ever.
       const expired = Boolean(out) && (Boolean(out.timedOut) || Date.now() - out.at >= deadline());
@@ -270,38 +336,55 @@
       const over = fresh && this.failed(exchange) && (!out || expired);
       if (over) _data.delete(exchange);
       if (_data.has(exchange)) return _data.get(exchange);
-      if (out && !(fresh && expired)) return bounded(out, exchange);
+      // Joined: this key is the one asked with now, so an answer of another
+      // key that comes first is not kept over it.
+      if (out && !(fresh && expired)) { _lastKey.set(exchange, key); return bounded(out, exchange); }
 
       // Which request this is: an older one that answers late does not
       // overwrite what a newer one already brought.
       const gen = (_gen.get(exchange) || 0) + 1;
       _gen.set(exchange, gen);
+      _lastKey.set(exchange, key);
+      // An answer for a key no longer asked with is kept nowhere.
+      const stale = () => _lastKey.get(exchange) !== key;
       const p = (async () => {
         const api = window.EODHD_API;
         if (!api || !api.getExchangeHolidaysV2) return null;
+        // A failure is kept to be asked again; a refusal of this key or
+        // plan is kept as its answer -- over hours an older request brought
+        // too: request 1 timed out, request 2 started, request 1 brought
+        // hours, request 2's 403 was dropped. Only the newest
+        // request settles here (the generation checks below); a failure
+        // still never takes away hours kept (keepFailure).
+        const settle = (body, daily) => {
+          const r = refusalOf(body._fail || failureOf(body));
+          if (r) keepRefusal(exchange, r, apiKey, gen, daily);
+          else keepFailure(exchange, body);
+        };
+        const dailyOf = (d) => Boolean(d && typeof d === 'object' && (d._dailyLimit || d.dailyLimit || (d.notServed && d.notServed.dailyLimit)));
         let raw;
         try {
           raw = await api.getExchangeHolidaysV2(apiKey, exchange, fresh ? { fresh: true } : undefined);
         } catch (e) {
           const failed = noStatus(null, e || {});
-          if (gen >= (_kept.get(exchange) || 0)) keepFailure(exchange, failed);
+          if (!stale() && gen >= (_kept.get(exchange) || 0)) settle(failed);
           return failed;
         }
         // v2 wraps the payload in { data: {...}, meta: [], links: [] }.
         // The legacy v1 endpoint returns the payload at the root. Unwrap
         // here so the rest of this module can stay agnostic.
         const data = normalisePayload(raw && raw.data && typeof raw.data === 'object' ? raw.data : raw, exchange);
-        if (gen < (_kept.get(exchange) || 0)) return data;
-        if (!hasStatus(data)) keepFailure(exchange, noStatus(data));
-        else if (data._failed) keepFailure(exchange, data);
+        if (stale() || gen < (_kept.get(exchange) || 0)) return data;
+        if (!hasStatus(data)) settle(noStatus(data), dailyOf(raw));
+        else if (data._failed) settle(data, dailyOf(raw));
         else { _data.set(exchange, data); _kept.set(exchange, gen); _failedAt.delete(exchange); }
         return data;
       })();
-      const entry = { p, at: Date.now() };
-      _inflight.set(exchange, entry);
+      const entry = { p, at: Date.now(), key };
+      _inflight.set(flight, entry);
       // Kept while it is out, however long: a caller that comes later joins
       // it rather than sending a second request beside one that hangs.
-      const done = () => { if (_inflight.get(exchange) === entry) _inflight.delete(exchange); };
+      const done = () => { if (_inflight.get(flight) === entry) _inflight.delete(flight); };
       p.then(done, done);
       return bounded(entry, exchange);
     },
@@ -322,6 +405,32 @@
     failure(exchange) {
       const d = _data.get(exchange);
       return d && d._failed ? (d._fail || failureOf(d)) : null;
+    },
+    // The status a refusal of the details was answered with (401, 402,
+    // 403), or 0. Loaded, not failed: nothing asks again, and no hours.
+    refused(exchange) {
+      const d = _data.get(exchange);
+      return (d && d._refused) || 0;
+    },
+    // Whether the screens that read an exchange's status say themselves
+    // what is missing, so a host's panel need not: a failure (their line
+    // with its Try again) or the plan's 403 ("… not included in this
+    // plan"). A refused key (401) or a spent day (402) is the panel's to
+    // say: the screens leave the line out for it.
+    says(exchange) {
+      return this.failed(exchange) || this.refused(exchange) === 403;
+    },
+    // The sentence a screen says a refusal with, `what` first ("Market
+    // hours"), never with a Try again; '' when there is none, or when a
+    // host's own panel says it already (hostSays: a 401, a 402).
+    refusalText(exchange, what) {
+      const d = _data.get(exchange);
+      const status = (d && d._refused) || 0;
+      if (!status || (status !== 403 && hostSays(status))) return '';
+      if (status === 403) return what + ' are not included in this plan.';
+      if (status === 401) return what + ' did not load: EODHD did not accept the API key (401).';
+      if (d._daily) return what + " did not load: EODHD's daily request limit was reached (402).";
+      return what + ' are not included in this plan (402).';
     },
 
     // The payload load() kept, and a way to hand one back: the calendar keeps

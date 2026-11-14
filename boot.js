@@ -11,7 +11,16 @@ window.APP_META = {
   "storage": [
     "eodhd_heatmap_"
   ],
-  "ownFailures": []
+  "ownFailures": [
+    "getExchangeHolidaysV2"
+  ],
+  "ownLines": {
+    "getExchangeHolidaysV2": [
+      "[data-own-fail=\"exchange-hours\"]",
+      "[data-heatmap-hours-refused]",
+      "[data-rl-fail]~market hours"
+    ]
+  }
 };
 
 if (!window.React || !window.ReactDOM) {

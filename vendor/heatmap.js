@@ -571,6 +571,9 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
   // says why nothing was sent, as every screen does.
   const rlWait = window.RateLimitWait.useWait();
   const waitLeft = rlWait.left;
+  // Drawn again when what a host's panel says of the key or the day
+  // changes: the hours' refusal line and the Pre-Market subtitle follow it.
+  window.RateLimitWait.useHostPanel();
   // Not a live region: it counts every second.
   const waitNoteEl = rlWait.note ? <p data-wait-note="true" style={{ margin: '10px 0 0', fontSize: 13, color: isDark ? C3.textDark : C3.textLightTheme }}>{rlWait.note}</p> : null;
   // Why the prices did not load, kept from when they failed
@@ -1487,6 +1490,11 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
       return Boolean(p && p.kind === 'key');
     } catch (_) { return false; }
   };
+  // The hours refused for this key (401, 402, 403; ExchangeStatus.refused):
+  // an answer, not a failure -- never asked again, no failure line. Its
+  // sentence (refusalText), or '' when a host's own panel says it.
+  const exRefusedText = heatmapExchange && exLoaded === heatmapExchange && window.ExchangeStatus && window.ExchangeStatus.refusalText
+    ? window.ExchangeStatus.refusalText(heatmapExchange, 'Market hours') : '';
   const showLimitDropdown = cfg?.limitOptions && cfg.limitOptions.length > 0;
   const currentCount = filteredData.length;
   // The tiles the map has before the Gainers/Losers filter.
@@ -1701,8 +1709,8 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
     const ES = window.ExchangeStatus;
     if (!ES || !ES.isPrevSessionQuote || !(ES.isLoaded && ES.isLoaded(heatmapExchange))) return null;
     // A status that failed tells no session: "Market closed" read off a
-    // missing one would be a guess.
-    if (ES.failed && ES.failed(heatmapExchange)) return null;
+    // missing one would be a guess. A refused one neither.
+    if ((ES.failed && ES.failed(heatmapExchange)) || (ES.refused && ES.refused(heatmapExchange))) return null;
     const hours = ES.getRegularHours(heatmapExchange);
     const tz = (hours && hours.tz) || 'America/New_York';
     const session = ES.getCurrentSession(heatmapExchange);
@@ -1747,7 +1755,9 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
         <div style={{ flex: 1 }}>
           <h1 ref={headingRef} tabIndex={-1} style={{ fontSize: '20px', fontWeight: '700', margin: 0 }}>Market Heatmap</h1>
           <p style={{ fontSize: '12px', color: isDark ? C3.textMutedDark : C3.textMutedLight, margin: 0 }}>
-            {cfg?.name} • {filter === 'all' ? (noPrices ? pricedCount : baseCount) + '/' + totalCount : currentCount + ' of ' + baseCount} {cfg?.type === 'crypto' ? 'coins' : cfg?.type === 'forex' ? 'pairs' : 'stocks'}
+            {/* No count while the first list is on its way: "S&P 500 • 0/500
+                stocks" over the spinner read as an empty index. */}
+            {cfg?.name}{(isForexOrCrypto ? loadingForexCrypto : loading) && !baseCount ? null : <>{' • '}{filter === 'all' ? (noPrices ? pricedCount : baseCount) + '/' + totalCount : currentCount + ' of ' + baseCount} {cfg?.type === 'crypto' ? 'coins' : cfg?.type === 'forex' ? 'pairs' : 'stocks'}</>}
             {filter !== 'all' && (' • ' + (filter === 'gainers' ? 'gainers' : 'losers') + ' only')}
             {noPrices
               // Nothing more where the host's panel already says why (the
@@ -1811,7 +1821,7 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
           was refused (hostSaysRefused). Its Try again reads "Loading…"
           while the status it asked for is out (busyKey). */}
       {exFail && exFail.ex === heatmapExchange && !hostSaysRefused() && (
-        <window.RateLimitWait.FailNote panel="heatmap-status" what={`The ${heatmapExchange} market hours`} failure={exFail.failure}
+        <window.RateLimitWait.FailNote panel="heatmap-status" ownFail="exchange-hours" what={`The ${heatmapExchange} market hours`} failure={exFail.failure}
           onRetry={askStatusAgain} autoRetry={false} isDark={isDark} extra="The session line and holiday notices need them."
           busyKey={exBusyKey(heatmapExchange)} style={{ margin: '0 20px 12px', fontSize: 12 }} />
       )}
@@ -2375,6 +2385,19 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
                   );
                 })}
               </div>
+            )}
+
+            {/* The exchange's hours refused: said once, under the map, with
+                nothing to retry; the map does not move. The
+                plan's 403 always; a refused key or a spent day (401, 402) unless
+                a host's own panel says it -- the terminal has none, and said
+                nothing. A live region, as the failure line is.
+                data-heatmap-hours-refused: the open apps' shell matches on it;
+                data-own-fail: the screen names this request itself. */}
+            {exRefusedText && (
+              <p role="status" data-heatmap-hours-refused="true" data-own-fail="exchange-hours" style={{ margin: '0 0 16px', fontSize: 12, lineHeight: 1.5, color: isDark ? C3.textMutedDark : C3.textMutedLight }}>
+                {exRefusedText}
+              </p>
             )}
 
             {/* Top Movers: priced rows only; none priced, no section */}
