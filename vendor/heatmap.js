@@ -580,7 +580,7 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
   // changes: the hours' refusal line and the Pre-Market subtitle follow it.
   window.RateLimitWait.useHostPanel();
   // Not a live region: it counts every second.
-  const waitNoteEl = rlWait.note ? <p data-wait-note="true" style={{ margin: '10px 0 0', fontSize: 13, color: isDark ? C3.textDark : C3.textLightTheme }}>{rlWait.note}</p> : null;
+  const waitNoteEl = rlWait.note ? <p data-wait-note="true" data-own-fail="quotes" style={{ margin: '10px 0 0', fontSize: 13, color: isDark ? C3.textDark : C3.textLightTheme }}>{rlWait.note}</p> : null;
   // Why the prices did not load, kept from when they failed
   // (RateLimitWait.failure): the quotes' batch (priceFail) or the screener's
   // rows (EODHD_API.screenerFailure). "Couldn't load prices for this market
@@ -589,11 +589,18 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
   // load" alone; with nothing known, as before.
   const [priceFail, setPriceFail] = React.useState(null);
   const knownFail = priceFail || (window.EODHD_API && window.EODHD_API.screenerFailure ? window.RateLimitWait.failure(window.EODHD_API.screenerFailure) : null);
-  const notLoadedText = (knownFail && knownFail.limited) || (!knownFail && waitLeft)
-    ? "Couldn't load prices for this market: EODHD's per-minute request limit was reached."
-    : knownFail && (knownFail.unreadable || knownFail.status || knownFail.at)
-      ? "Couldn't load prices for this market: " + window.RateLimitWait.failReason(knownFail)
-      : "Couldn't load prices for this market right now.";
+  // A refused key or a spent day (401, 402) is the open apps' panel's to
+  // say: the line under it says only that the prices did not load. Any
+  // other failure is said here with its reason, and the panel leaves it to
+  // this line; "Nothing below is missing data" is the panel's sentence,
+  // never a screen's.
+  const notLoadedText = knownFail && window.RateLimitWait.hostSaysKey(knownFail)
+    ? window.RateLimitWait.panelLine('The prices for this market')
+    : (knownFail && knownFail.limited) || (!knownFail && waitLeft)
+      ? "Couldn't load prices for this market: EODHD's per-minute request limit was reached."
+      : knownFail && (knownFail.unreadable || knownFail.status || knownFail.at)
+        ? "Couldn't load prices for this market: " + window.RateLimitWait.failReason(knownFail)
+        : "Couldn't load prices for this market right now.";
   const retryLabel = waitLeft ? `Try again in ${waitLeft} s` : 'Try again';
   const retryLook = waitLeft ? { background: 'transparent', border: '1px solid ' + (isDark ? 'rgba(255,255,255,0.25)' : 'rgba(0,0,0,0.25)'), color: isDark ? C3.textMutedDark : C3.textMutedLight, cursor: 'not-allowed' } : {};
   const retryMembers = () => {
@@ -1408,6 +1415,16 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
   // indices map to US; if you add international indices later, key the
   // mapping off cfg.exchange.
   const heatmapExchange = isForexOrCrypto ? null : (cfg?.exchange || 'US');
+  // The tab that reads the exchange's hours says so (ExchangeStatus.use):
+  // under Crypto and Forex, which trade around the clock, a failure of the
+  // US hours is said by nobody -- the open apps' panel came up over them
+  // 3-4 s after the S&P 500's hours failed, and the page moved 177 px.
+  // Back on S&P 500 its line comes back.
+  React.useEffect(() => {
+    const ES = window.ExchangeStatus;
+    if (!heatmapExchange || !ES || typeof ES.use !== 'function') return undefined;
+    return ES.use(heatmapExchange);
+  }, [heatmapExchange]);
   const [exBanner, setExBanner] = React.useState(null);
   React.useEffect(() => {
     const RLW = window.RateLimitWait;
@@ -1443,7 +1460,13 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
       const failed = ES.failed && ES.failed(heatmapExchange);
       setExFail(failed ? { ex: heatmapExchange, failure: (ES.failure && ES.failure(heatmapExchange)) || null } : null);
       const due = failed && ES.retryIn ? ES.retryIn(heatmapExchange) : null;
-      if (due != null) retryTimer = setTimeout(() => { if (!cancelled) { exAskFreshRef.current = true; setExAsk(n => n + 1); } }, due + 50);
+      // At the limit (429) one repeat after the wait, by the line's own
+      // reload (RateLimitWait.useReloadAfterWait), then only Try again or
+      // the screen opened again: this pace asked
+      // again after every wait (3 asks in the open apps' matrix). Any
+      // other failure keeps the pace.
+      const limitedNow = failed && ES.failure && (ES.failure(heatmapExchange) || {}).limited;
+      if (due != null && !limitedNow) retryTimer = setTimeout(() => { if (!cancelled) { exAskFreshRef.current = true; setExAsk(n => n + 1); } }, due + 50);
       const session = ES.getCurrentSession(heatmapExchange);
       const hol = ES.getHolidayToday(heatmapExchange);
       const isEarly = ES.isEarlyCloseToday(heatmapExchange);
@@ -1497,9 +1520,13 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
   };
   // The hours refused for this key (401, 402, 403; ExchangeStatus.refused):
   // an answer, not a failure -- never asked again, no failure line. Its
-  // sentence (refusalText), or '' when a host's own panel says it.
+  // sentence (refusalText); under a host's own panel that says the key or
+  // the day, "Market hours did not load. See the panel above." -- with no
+  // line the panel read "Nothing below is missing data; the requests were
+  // refused before any data was read" over a map without its hours (the
+  // open apps' failure matrix).
   const exRefusedText = heatmapExchange && exLoaded === heatmapExchange && window.ExchangeStatus && window.ExchangeStatus.refusalText
-    ? window.ExchangeStatus.refusalText(heatmapExchange, 'Market hours') : '';
+    ? window.ExchangeStatus.refusalText(heatmapExchange, 'Market hours', { panel: true }) : '';
   const showLimitDropdown = cfg?.limitOptions && cfg.limitOptions.length > 0;
   const currentCount = filteredData.length;
   // The tiles the map has before the Gainers/Losers filter.
@@ -1771,13 +1798,17 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
               // Still, the line says that no quote came back: "Crypto • 20/20
               // coins • 2026-10-26" over twenty "—" tiles read as a priced
               // map of the S&P screener's day.
-              ? ((window.Entitlement && window.Entitlement.explained && window.Entitlement.explained()) ? ' • no quotes came back' : " • Couldn't load prices")
+              // A refused key or a spent day under a host's own panel: nothing
+              // here -- the line below points at the panel, and the count
+              // reads "0/20" (the open apps' matrix).
+              ? (knownFail && window.RateLimitWait.hostSaysKey(knownFail) ? null
+                : (window.Entitlement && window.Entitlement.explained && window.Entitlement.explained()) ? <span data-own-fail="quotes">{' • no quotes came back'}</span> : <span data-own-fail="quotes">{" • Couldn't load prices"}</span>)
               : (unpricedCount > 0 && ' • ' + unpricedCount + ' without a quote yet')}
             {sessionMode === 'premarket' && !isForexOrCrypto
               ? (rtLoading
                   ? ' • Pre-Market • loading...'
                   : premarketMeta.failed
-                  ? (premarketMeta.fail ? ' • Pre-Market • quotes did not load: ' + window.RateLimitWait.failReason(premarketMeta.fail) : ' • Pre-Market • no pre-market quotes available')
+                  ? (premarketMeta.fail ? <span data-own-fail="quotes" data-see-panel={window.RateLimitWait.hostSaysKey(premarketMeta.fail) ? 'true' : undefined}>{' • Pre-Market • quotes did not load: ' + window.RateLimitWait.failReason(premarketMeta.fail)}</span> : ' • Pre-Market • no pre-market quotes available')
                   : ` • Pre-Market • delayed ~15m${premarketMeta.lastEthTime ? ' • last ' + new Date(premarketMeta.lastEthTime < 4e10 ? premarketMeta.lastEthTime * 1000 : premarketMeta.lastEthTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}${premarketMeta.tradedCount ? ' • ' + premarketMeta.tradedCount + ' traded' : ''}`)
               : (() => {
                   // Labelled by the feed actually behind the prices, never a
@@ -1827,7 +1858,7 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
           while the status it asked for is out (busyKey). */}
       {exFail && exFail.ex === heatmapExchange && !hostSaysRefused() && (
         <window.RateLimitWait.FailNote panel="heatmap-status" ownFail="exchange-hours" what={`The ${heatmapExchange} market hours`} failure={exFail.failure}
-          onRetry={askStatusAgain} autoRetry={false} isDark={isDark} extra="The session line and holiday notices need them."
+          onRetry={askStatusAgain} autoRetry={Boolean(exFail.failure && exFail.failure.limited)} asked={heatmapExchange} isDark={isDark} extra="The session line and holiday notices need them."
           busyKey={exBusyKey(heatmapExchange)} style={{ margin: '0 20px 12px', fontSize: 12 }} />
       )}
 
@@ -2047,10 +2078,8 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
           </div>
         ) : filteredData.length === 0 ? (
           <div style={{ textAlign: 'center', padding: '48px 0' }}>
-            <p style={{ color: isDark ? C3.textMutedDark : C3.textMutedLight, marginBottom: '16px' }}>
-              {window.Entitlement && window.Entitlement.explained && window.Entitlement.explained()
-                ? 'Nothing below is missing data — the request was not served. See the panel above.'
-                : notLoadedText}
+            <p data-own-fail="quotes" data-see-panel={window.RateLimitWait.seesPanel(notLoadedText)} style={{ color: isDark ? C3.textMutedDark : C3.textMutedLight, marginBottom: '16px' }}>
+              {notLoadedText}
             </p>
             <button data-heatmap-retry="true" aria-disabled={retrying || !!waitLeft || undefined} onClick={(e) => tryAgain(e, () => { if (isForexOrCrypto) { loadForexCryptoData(cfg); return; } retryMembers(); if (onLoadData) onLoadData(); })} style={{
               padding: '12px 24px', background: C3.logoGradient, border: 'none',
@@ -2070,10 +2099,8 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
               <div style={{ textAlign: 'center', padding: '16px 0 20px' }}>
                 {/* The words are the live region; the button counts the wait
                     every second and stays outside it. */}
-                <p role="status" style={{ color: isDark ? C3.textMutedDark : C3.textMutedLight, margin: '0 0 12px' }}>
-                  {window.Entitlement && window.Entitlement.explained && window.Entitlement.explained()
-                    ? 'Nothing below is missing data — the request was not served. See the panel above.'
-                    : notLoadedText}
+                <p role="status" data-own-fail="quotes" data-see-panel={window.RateLimitWait.seesPanel(notLoadedText)} style={{ color: isDark ? C3.textMutedDark : C3.textMutedLight, margin: '0 0 12px' }}>
+                  {notLoadedText}
                 </p>
                 <button data-heatmap-retry="true" aria-disabled={retrying || !!waitLeft || undefined} onClick={(e) => tryAgain(e, () => { if (isForexOrCrypto) { loadForexCryptoData(cfg); return; } retryMembers(); refreshRealTime(); })} style={{
                   padding: '10px 20px', background: C3.logoGradient, border: 'none',
@@ -2400,7 +2427,7 @@ window.HeatmapView = ({ heatmapData: rawHeatmapData, loading, onLoadData, onSele
                 data-heatmap-hours-refused: the open apps' shell matches on it;
                 data-own-fail: the screen names this request itself. */}
             {exRefusedText && (
-              <p role="status" data-heatmap-hours-refused="true" data-own-fail="exchange-hours" style={{ margin: '0 0 16px', fontSize: 12, lineHeight: 1.5, color: isDark ? C3.textMutedDark : C3.textMutedLight }}>
+              <p role="status" data-heatmap-hours-refused="true" data-own-fail="exchange-hours" data-see-panel={window.RateLimitWait && window.RateLimitWait.seesPanel ? window.RateLimitWait.seesPanel(exRefusedText) : undefined} style={{ margin: '0 0 16px', fontSize: 12, lineHeight: 1.5, color: isDark ? C3.textMutedDark : C3.textMutedLight }}>
                 {exRefusedText}
               </p>
             )}

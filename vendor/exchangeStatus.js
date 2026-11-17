@@ -46,6 +46,11 @@
   // later load asks again once the pace allows (retryIn), instead of the
   // failure standing for the page's life.
   const _failedAt = new Map();
+  // How many screens read each exchange's hours now (use / inUse).
+  const _users = new Map();
+  const tellUse = (exchange) => {
+    try { window.dispatchEvent(new CustomEvent('exchange-status:use', { detail: { exchange, inUse: (_users.get(exchange) || 0) > 0 } })); } catch (_) { /* a courtesy */ }
+  };
 
   const todayISOInTZ = (tz) => {
     try {
@@ -228,22 +233,17 @@
     _failedAt.delete(exchange);
   };
   // Whether a host's own panel above the screens (the open apps' frame)
-  // says a refusal already: the key refused (401); the day spent, or the
-  // plan refusing a feed (402). The terminal has no such panel, and its
-  // screens say every refusal themselves: a 401 or 402 there said nothing at
-  // all. A 403 is always the screens' to say (says()).
+  // says a refusal: the key refused (401) or the day spent (402), always
+  // where there is a host. The terminal has no such
+  // panel, and its screens say every refusal themselves: a 401 or 402 there
+  // said nothing at all. A 403 is always the screens' to say
+  // (says()).
   const hostSays = (status) => {
     // One rule with every other line (RateLimitWait.hostSaysKey).
     const R = window.RateLimitWait;
     if (R && typeof R.hostSaysKey === 'function') return R.hostSaysKey({ status, limited: false, unreadable: false });
     const E = window.Entitlement;
-    if (!E) return false;
-    try {
-      const p = typeof E.problem === 'function' ? E.problem() : null;
-      if (status === 401) return Boolean(p && (p.kind === 'key' || p.status === 401));
-      if (status === 402) return Boolean((typeof E.anyDenied === 'function' && E.anyDenied()) || (p && p.status === 402));
-    } catch (_) { return false; }
-    return false;
+    return (status === 401 || status === 402) && Boolean(E && typeof E.problem === 'function');
   };
   const hasStatus = (data) => Boolean(data) && typeof data === 'object' && !Array.isArray(data) && !data.error && !data.notServed;
   const keepFailure = (exchange, body) => {
@@ -422,15 +422,47 @@
     },
     // The sentence a screen says a refusal with, `what` first ("Market
     // hours"), never with a Try again; '' when there is none, or when a
-    // host's own panel says it already (hostSays: a 401, a 402).
-    refusalText(exchange, what) {
+    // host's own panel says it already (hostSays: a 401, a 402) -- or, with
+    // opts.panel, "<what> did not load. See the panel above.": a screen
+    // whose whole content is what was refused (the calendar's Holidays)
+    // says that much rather than nothing. A 402 is the
+    // day's limit, never "not included in this plan" (a 403's words).
+    refusalText(exchange, what, opts) {
       const d = _data.get(exchange);
       const status = (d && d._refused) || 0;
-      if (!status || (status !== 403 && hostSays(status))) return '';
+      if (!status) return '';
       if (status === 403) return what + ' are not included in this plan.';
+      if (hostSays(status)) return opts && opts.panel ? what + ' did not load. See the panel above.' : '';
       if (status === 401) return what + ' did not load: EODHD did not accept the API key (401).';
-      if (d._daily) return what + " did not load: EODHD's daily request limit was reached (402).";
-      return what + ' are not included in this plan (402).';
+      return what + " did not load: EODHD's daily request limit was reached (402).";
+    },
+
+    // Which exchanges a screen on the page reads the hours of now. A
+    // failure of an exchange no screen uses at the moment -- the US hours
+    // under the heatmap's Crypto or Forex tab -- is said by nobody there,
+    // neither a line nor a host's panel; its line comes back with the tab
+    // that uses it (the panel came
+    // up over Crypto 3-4 s after the S&P 500's hours failed, and the page
+    // moved 177 px). use() returns the release; inUse() is true while a
+    // screen uses the exchange, false once every screen that used it has
+    // let go, and null for one no screen ever said it uses (asked as
+    // before). A change is told as 'exchange-status:use' on window.
+    use(exchange) {
+      if (!exchange) return () => {};
+      const ex = String(exchange);
+      _users.set(ex, (_users.get(ex) || 0) + 1);
+      tellUse(ex);
+      let done = false;
+      return () => {
+        if (done) return;
+        done = true;
+        _users.set(ex, Math.max(0, (_users.get(ex) || 0) - 1));
+        tellUse(ex);
+      };
+    },
+    inUse(exchange) {
+      const ex = String(exchange);
+      return _users.has(ex) ? _users.get(ex) > 0 : null;
     },
 
     // The payload load() kept, and a way to hand one back: the calendar keeps
