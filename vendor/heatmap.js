@@ -5,12 +5,17 @@ window.SquarifiedTreemap = function(items, rect) {
     return [Object.assign({}, items[0], { x: rect.x, y: rect.y, w: rect.w, h: rect.h })];
   }
 
-  // Normalize weights so they sum to the area of the rect
-  var totalWeight = items.reduce(function(s, it) { return s + (it.weight || 1); }, 0);
-  if (totalWeight <= 0) totalWeight = 1;
+  // Normalize weights so they sum to the area of the rect. A weight that is
+  // not a finite number above 0 counts as 1: `weight || 1` kept a negative
+  // weight (negative areas, a broken layout) and Infinity (NaN rects).
+  var weights = items.map(function(it) {
+    var w = Number(it.weight);
+    return Number.isFinite(w) && w > 0 ? w : 1;
+  });
+  var totalWeight = weights.reduce(function(s, w) { return s + w; }, 0);
   var area = rect.w * rect.h;
-  var normalized = items.map(function(it) {
-    return Object.assign({}, it, { normWeight: ((it.weight || 1) / totalWeight) * area });
+  var normalized = items.map(function(it, i) {
+    return Object.assign({}, it, { normWeight: (weights[i] / totalWeight) * area });
   });
 
   // Sort descending by weight
