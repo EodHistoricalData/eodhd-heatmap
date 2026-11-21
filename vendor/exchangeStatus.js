@@ -33,9 +33,13 @@
   // that don't want to wait for the localStorage round-trip.
   const _data = new Map();
   const _inflight = new Map();
-  // The latest request asked per exchange, and the one whose answer is kept.
+  // The latest request asked per exchange, and the request whose hours are
+  // kept (only hours: a refusal or a failure never outranks hours).
   const _gen = new Map();
   const _kept = new Map();
+  // Each key's refusal per exchange ({ status, daily }): a refusal is the
+  // key's own and never takes away hours known (keepRefusal).
+  const _refusedBy = new Map();
   // The key the latest request was asked with, per exchange: an answer for
   // another key is not this one's.
   const _lastKey = new Map();
@@ -48,43 +52,72 @@
   const _failedAt = new Map();
   // How many screens read each exchange's hours now (use / inUse).
   const _users = new Map();
+  // An exchange's status changed -- hours kept, a refusal, a failure -- told
+  // as 'exchange-status:changed' on window ({ exchange }), so a screen that
+  // read it before the answer came reads it again at once. The asset page's
+  // pill read "STATUS UNKNOWN" until its 30-second tick when the hours came
+  // in by another request than its own.
+  const tellChanged = (exchange) => {
+    try { window.dispatchEvent(new CustomEvent('exchange-status:changed', { detail: { exchange } })); } catch (_) { /* a courtesy */ }
+  };
   const tellUse = (exchange) => {
     try { window.dispatchEvent(new CustomEvent('exchange-status:use', { detail: { exchange, inUse: (_users.get(exchange) || 0) > 0 } })); } catch (_) { /* a courtesy */ }
   };
 
-  const todayISOInTZ = (tz) => {
+  // The moment the helpers below read: now, or `at` (a quote's time, unix
+  // seconds or ms).
+  const dateOf = (at) => {
+    if (at == null) return new Date();
+    const n = Number(at);
+    return new Date(Number.isFinite(n) && n < 4e10 ? n * 1000 : n);
+  };
+
+  const todayISOInTZ = (tz, at) => {
     try {
       // 'en-CA' yields YYYY-MM-DD reliably. Intl handles DST correctly.
       const fmt = new Intl.DateTimeFormat('en-CA', {
         timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
       });
-      return fmt.format(new Date());
+      return fmt.format(dateOf(at));
     } catch (_) {
-      return new Date().toISOString().slice(0, 10);
+      return dateOf(at).toISOString().slice(0, 10);
     }
   };
 
-  const nowHHMMInTZ = (tz) => {
+  const nowHHMMInTZ = (tz, at) => {
     try {
       const fmt = new Intl.DateTimeFormat('en-GB', {
         timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false,
       });
-      return fmt.format(new Date()); // 'HH:MM'
+      return fmt.format(dateOf(at)); // 'HH:MM'
     } catch (_) {
-      const d = new Date();
-      return d.toTimeString().slice(0, 5);
+      return dateOf(at).toTimeString().slice(0, 5);
     }
   };
 
-  const dayOfWeekInTZ = (tz) => {
+  const dayOfWeekInTZ = (tz, at) => {
     // 0=Sun, 1=Mon, ... 6=Sat
     try {
       const fmt = new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'short' });
       const map = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
-      return map[fmt.format(new Date())] ?? new Date().getDay();
+      return map[fmt.format(dateOf(at))] ?? dateOf(at).getDay();
     } catch (_) {
-      return new Date().getDay();
+      return dateOf(at).getDay();
     }
+  };
+
+  // The forex week: from Sunday 17:00 to Friday 17:00 New York time, the
+  // market's usual convention (Sydney opens it, New York closes it), closed
+  // at the weekend.
+  const FX_TZ = 'America/New_York';
+  const FX_OPENS = '17:00';
+  const fxSession = (at) => {
+    const dow = dayOfWeekInTZ(FX_TZ, at);
+    const t = nowHHMMInTZ(FX_TZ, at);
+    if (dow === 6) return 'closed';
+    if (dow === 0) return t >= FX_OPENS ? 'regular' : 'closed';
+    if (dow === 5) return t < FX_OPENS ? 'regular' : 'closed';
+    return 'regular';
   };
 
   const cmpHHMM = (a, b) => {
@@ -224,13 +257,22 @@
   // after each ask. `refused()` says which it was.
   const REFUSALS = { 401: true, 402: true, 403: true };
   const refusalOf = (f) => (f && !f.limited && !f.unreadable && REFUSALS[f.status] ? f.status : 0);
-  // `gen`: the request it answered -- kept as the newest answer, so an older
-  // request that brings hours late does not overwrite it.
-  // `daily`: a 402 the open apps' client read as the day's limit spent.
+  // A refusal is the key's: kept as that key's answer, and said while no
+  // hours are known. It never takes away hours known -- they are the
+  // exchange's, whoever asked, and in whatever order the answers come: key
+  // B's 403 after key A's hours left every screen without the session
+  // (getRegularHours null), and A's hours arriving after B's 403 were
+  // dropped as an older request's. `daily`: a 402 the open
+  // apps' client read as the day's limit spent.
   const keepRefusal = (exchange, status, apiKey, gen, daily) => {
-    _data.set(exchange, { _notFound: true, _refused: status, _daily: Boolean(daily), _key: apiKey == null ? null : String(apiKey) });
-    if (gen) _kept.set(exchange, gen);
+    const key = apiKey == null ? null : String(apiKey);
+    if (!_refusedBy.has(exchange)) _refusedBy.set(exchange, new Map());
+    _refusedBy.get(exchange).set(key, { status, daily: Boolean(daily) });
+    const had = _data.get(exchange);
+    if (had && !had._failed && !had._refused) return;     // hours known: they stay
+    _data.set(exchange, { _notFound: true, _refused: status, _daily: Boolean(daily), _key: key });
     _failedAt.delete(exchange);
+    tellChanged(exchange);
   };
   // Whether a host's own panel above the screens (the open apps' frame)
   // says a refusal: the key refused (401) or the day spent (402), always
@@ -242,8 +284,16 @@
     // One rule with every other line (RateLimitWait.hostSaysKey).
     const R = window.RateLimitWait;
     if (R && typeof R.hostSaysKey === 'function') return R.hostSaysKey({ status, limited: false, unreadable: false });
+    // The same rule without it: only while the panel is up and says it.
     const E = window.Entitlement;
-    return (status === 401 || status === 402) && Boolean(E && typeof E.problem === 'function');
+    if ((status !== 401 && status !== 402) || !E || typeof E.problem !== 'function') return false;
+    try {
+      const p = E.problem();
+      if (p && Number(p.status) === status) return true;
+      return status === 402 && typeof E.anyDenied === 'function' && Boolean(E.anyDenied());
+    } catch (_) {
+      return false;
+    }
   };
   const hasStatus = (data) => Boolean(data) && typeof data === 'object' && !Array.isArray(data) && !data.error && !data.notServed;
   const keepFailure = (exchange, body) => {
@@ -252,6 +302,7 @@
     _data.set(exchange, { ...body, _fail: body._fail || failureOf(body) });
     const f = _failedAt.get(exchange);
     _failedAt.set(exchange, { at: Date.now(), n: (f ? f.n : 0) + 1 });
+    tellChanged(exchange);
   };
   // The pace of the asking again: as every panel's automatic reload
   // (RateLimitWait.reloadDelay -- 5 s, 10 s, 20 s ... 2 min).
@@ -295,6 +346,12 @@
       return US_INDICES.has(code) ? 'US' : null;
     },
 
+    // Forex keeps a week of its own (fxSession), not crypto's 24/7; it has no
+    // exchange details to load either (is24x7 below says that).
+    isForex(exchange) {
+      return String(exchange || '').toUpperCase() === 'FOREX';
+    },
+
     is24x7(exchange) {
       const e = (exchange || '').toUpperCase();
       return e === 'FOREX' || e === 'CC' || e === 'CRYPTO';
@@ -312,7 +369,15 @@
       // minutes under the exchange alone, and handed key A's 403 to key B
       // with no request.
       const key = keyOf(apiKey);
-      const had = _data.get(exchange);
+      let had = _data.get(exchange);
+      // This key's own refusal, with no hours known: its answer, not asked
+      // again -- also after another key's refusal took the shared entry.
+      const mine = _refusedBy.has(exchange) ? _refusedBy.get(exchange).get(key) : null;
+      if (mine && !(had && !had._failed && !had._refused) && !(had && had._refused && had._key === key)) {
+        had = { _notFound: true, _refused: mine.status, _daily: mine.daily, _key: key };
+        _data.set(exchange, had);
+        _failedAt.delete(exchange);
+      }
       const otherKey = Boolean(had && had._refused && had._key !== key);
       if (otherKey) _data.delete(exchange);
       const fresh = !!(opts && opts.fresh) || due || otherKey;
@@ -374,10 +439,22 @@
         // The legacy v1 endpoint returns the payload at the root. Unwrap
         // here so the rest of this module can stay agnostic.
         const data = normalisePayload(raw && raw.data && typeof raw.data === 'object' ? raw.data : raw, exchange);
-        if (stale() || gen < (_kept.get(exchange) || 0)) return data;
+        const hours = hasStatus(data) && !data._failed;
+        // Hours a newer request already brought are not overwritten by an
+        // older request's; nothing else outranks hours.
+        if (hours && gen < (_kept.get(exchange) || 0)) return data;
+        if (!hours && gen < (_gen.get(exchange) || 0) && _data.has(exchange) && !_data.get(exchange)._failed) return data;
+        // Hours are the exchange's, whoever asked: hours a request of another
+        // key brings are kept too, unless a newer answer is. Only a refusal
+        // or a failure is the key's own. The asset page's pill asked with
+        // the app's key and the live feed with the account's: the pill's
+        // answer was dropped as another key's, and it read "STATUS UNKNOWN"
+        // until the feed's answer and its 30-second tick (XETRA, LSE; SW,
+        // which the feed does not stream, read CLOSED at once).
+        if (stale() && !hours) return data;
         if (!hasStatus(data)) settle(noStatus(data), dailyOf(raw));
         else if (data._failed) settle(data, dailyOf(raw));
-        else { _data.set(exchange, data); _kept.set(exchange, gen); _failedAt.delete(exchange); }
+        else { _data.set(exchange, data); _kept.set(exchange, gen); _failedAt.delete(exchange); tellChanged(exchange); }
         return data;
       })();
       const entry = { p, at: Date.now(), key };
@@ -530,12 +607,13 @@
       };
     },
 
-    getHolidayToday(exchange) {
+    // `at`: the day of that moment (a quote's time) instead of today.
+    getHolidayToday(exchange, at) {
       const d = this._get(exchange);
       if (!d) return null;
       const hours = this.getRegularHours(exchange);
       const tz = hours ? hours.tz : (d.Timezone || 'UTC');
-      const today = todayISOInTZ(tz);
+      const today = todayISOInTZ(tz, at);
       const hol = d.ExchangeHolidays || d.Holidays || {};
       // v2 — date-keyed object. v1 — array with Date field.
       if (Array.isArray(hol)) {
@@ -616,17 +694,22 @@
       return hours ? hours.close.slice(0, 5) : null;
     },
 
-    getCurrentSession(exchange) {
+    // `at` (unix seconds or ms): the session at that moment -- a quote's
+    // own time -- instead of now.
+    getCurrentSession(exchange, at) {
+      // Forex has a week of its own (fxSession): open Sunday evening to
+      // Friday evening, closed at the weekend. Crypto never closes.
+      if (this.isForex(exchange)) return fxSession(at);
       if (this.is24x7(exchange)) return 'regular';
       const hours = this.getRegularHours(exchange);
       if (!hours) return 'unknown';
-      const dow = dayOfWeekInTZ(hours.tz);
+      const dow = dayOfWeekInTZ(hours.tz, at);
       if (dow === 0 || dow === 6) return 'closed';
-      const hol = this.getHolidayToday(exchange);
+      const hol = this.getHolidayToday(exchange, at);
       const earlyClose = hol && /early|half/i.test(hol.type || '');
       if (hol && !earlyClose) return 'closed';
 
-      const t = nowHHMMInTZ(hours.tz);
+      const t = nowHHMMInTZ(hours.tz, at);
       const regularClose = earlyClose ? (hol.closeAt || hours.close) : hours.close;
 
       if (hours.preOpen && hours.preClose
@@ -668,7 +751,59 @@
       const s = this.getCurrentSession(exchange);
       return s === 'regular' || s === 'lunch';
     },
+
+    // Which side of today's regular session it is now: 'pre' before the
+    // open, 'after' from the close, null in the session, on a day off, or
+    // with no hours known. A closed exchange with no extended sessions of
+    // its own (LSE) still has a before and an after: a trade the feed
+    // reports at 17:29 London is an after-hours print, not a live one.
+    // `at` as in getCurrentSession: the side of that moment's session.
+    sideOfSession(exchange, at) {
+      const s = this.getCurrentSession(exchange, at);
+      if (s === 'pre' || s === 'after') return s;
+      if (s !== 'closed' || this.is24x7(exchange) || this.isForex(exchange)) return null;
+      const hours = this.getRegularHours(exchange);
+      if (!hours) return null;
+      const dow = dayOfWeekInTZ(hours.tz, at);
+      if (dow === 0 || dow === 6) return null;
+      const hol = this.getHolidayToday(exchange, at);
+      const early = !!(hol && /early|half/i.test(hol.type || ''));
+      if (hol && !early) return null;
+      const t = nowHHMMInTZ(hours.tz, at);
+      if (cmpHHMM(t, hours.open) < 0) return 'pre';
+      if (cmpHHMM(t, early ? (hol.closeAt || hours.close) : hours.close) >= 0) return 'after';
+      return null;
+    },
+
+    // One clock for every screen that shows a session: it fires on the wall
+    // clock's half-minutes, so readers that look on it turn together at the
+    // open and the close. The asset page read its session once and the pill
+    // on a 30-second timer of its own: after the London close the pill said
+    // CLOSED while the page went on with "regular". Returns the unsubscribe.
+    onClock(cb) {
+      if (typeof cb !== 'function') return () => {};
+      _clockSubs.add(cb);
+      armClock();
+      return () => {
+        _clockSubs.delete(cb);
+        if (!_clockSubs.size && _clockTimer) { clearTimeout(_clockTimer); _clockTimer = null; }
+      };
+    },
   };
+
+  // Sessions turn on whole minutes; a tick just past each half-minute sees
+  // the new one.
+  const CLOCK_MS = 30000;
+  const _clockSubs = new Set();
+  let _clockTimer = null;
+  function armClock() {
+    if (_clockTimer || !_clockSubs.size) return;
+    _clockTimer = setTimeout(() => {
+      _clockTimer = null;
+      Array.from(_clockSubs).forEach((f) => { try { f(); } catch (_) { /* one reader does not stop the rest */ } });
+      armClock();
+    }, CLOCK_MS - (Date.now() % CLOCK_MS) + 50);
+  }
 
   window.ExchangeStatus = ExchangeStatus;
 })();
